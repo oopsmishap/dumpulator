@@ -75,7 +75,12 @@ def ZwQueryInformationThread(dp: Dumpulator,
     raise Exception()
 
 @syscall
-def ZwOpenSection(dp: Dumpulator):
+def ZwOpenSection(dp: Dumpulator,
+                  SectionHandle: P(HANDLE),
+                  DesiredAccess: ACCESS_MASK,
+                  ObjectAttributes: P(OBJECT_ATTRIBUTES)
+                  ):
+    attr = OBJECT_ATTRIBUTES.from_buffer(dp.read(ObjectAttributes.ptr, ctypes.sizeof(OBJECT_ATTRIBUTES)))
     return STATUS_NOT_IMPLEMENTED
 
 @syscall

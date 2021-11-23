@@ -1,10 +1,106 @@
 import struct
-from enum import Enum
+from enum import Enum, IntFlag
 from typing import Optional
+import ctypes
 
 
 def make_global(t):
     globals().update(t.__members__)
+
+
+class Architecture:
+    def __init__(self, pointer_size):
+        self.pointer_size = pointer_size
+
+class Int:
+    size = 0
+
+    def __init__(self, value):
+        self.value = value
+
+    def __str__(self):
+        return f"0x{self:X}"
+
+class ULONG(Int):
+    size = 4
+
+    def __init__(self, value):
+        super().__init__(value & 0xFFFFFFFF)
+
+
+class USHORT(Int):
+    size = 2
+
+    def __init__(self, value):
+        super().__init__(value & 0xFFFF)
+
+class HANDLE(Int):
+    size = -1
+    pass
+
+class SIZE_T(Int):
+    size = -1
+    pass
+
+
+class ULONG_PTR(Int):
+    size = -1
+
+
+class PVOID:
+    def __init__(self, ptr, mem_read):
+        self.ptr = ptr
+        self.type: Optional[type] = None
+        self.read = lambda size: mem_read(ptr, size)
+
+    def __getitem__(self, index):
+        return struct.unpack("<Q", self.read(8))
+
+    def __int__(self):
+        return self.ptr
+
+    def __eq__(self, other):
+        return self.ptr == other
+
+    def __ne__(self, other):
+        return self.ptr != other
+
+    def __str__(self):
+        return f"0x{self:X}"
+
+    def read_str(self, size, encoding="utf8"):
+        return self.read(size).decode(encoding)
+
+
+def P(t):
+    class P(PVOID):
+        def __init__(self, ptr, mem_read):
+            super().__init__(ptr, mem_read)
+            self.type = t
+    return P
+
+
+class Structure:
+    _pack_ = 1
+    _fields_ = []
+
+class UNICODE_STRING(Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("Length", )
+    ]
+
+
+"""
+class UNICODE_STRING(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("Length", ctypes.c_ushort),
+        ("MaximumLength", ctypes.c_ushort),
+        ("Buffer", ctypes.c_void_p)
+    ]
+"""
+
 
 STATUS_SUCCESS = 0
 STATUS_NOT_IMPLEMENTED = 0xC0000002
@@ -87,64 +183,24 @@ class FS_INFORMATION_CLASS(Enum):
     FileFsMetadataSizeInformation = 13
 make_global(FS_INFORMATION_CLASS)
 
+
 MEM_COMMIT = 0x1000
 MEM_RESERVE = 0x2000
 PAGE_READWRITE = 0x4
 
-
-class Int(int):
-    def __str__(self):
-        return f"0x{self:X}"
-
-
-class PVOID:
-    def __init__(self, ptr, mem_read):
-        self.ptr = ptr
-        self.type: Optional[type] = None
-        self.read = lambda size: mem_read(ptr, size)
-
-    def __getitem__(self, index):
-        return struct.unpack("<Q", self.read(8))
-
-    def __int__(self):
-        return self.ptr
-
-    def __eq__(self, other):
-        return self.ptr == other
-
-    def __ne__(self, other):
-        return self.ptr != other
-
-    def __str__(self):
-        return f"0x{self:X}"
-
-    def read_str(self, size, encoding="utf8"):
-        return self.read(size).decode(encoding)
-
-
-def P(t):
-    class P(PVOID):
-        def __init__(self, ptr, mem_read):
-            super().__init__(ptr, mem_read)
-            self.type = t
-    return P
-
-
-class HANDLE(Int):
+class ACCESS_MASK(ULONG):
     pass
 
-class SIZE_T(Int):
-    pass
-
-
-class ULONG_PTR(Int):
-    pass
-
-
-class ULONG(Int):
-    def __new__(cls, value):
-        return Int.__new__(cls, value & 0xFFFFFFFF)
-
+class OBJECT_ATTRIBUTES(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("Length", ctypes.c_ulong),
+        ("RootDirectory", ctypes.c_ulong),
+        ("ObjectName", ctypes.c_ulong),
+        ("Attributes", ctypes.c_ulong),
+        ("SecurityDescriptor", ctypes.c_ulong),
+        ("SecurityQualityOfService", ctypes.c_ulong)
+    ]
 
 class IO_APC_ROUTINE:
     pass
