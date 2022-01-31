@@ -521,6 +521,7 @@ class Dumpulator(Architecture):
         self._uc.hook_add(UC_HOOK_INSN, _hook_syscall, user_data=self, arg1=UC_X86_INS_SYSENTER)
         self._uc.hook_add(UC_HOOK_INTR, _hook_interrupt, user_data=self)
         self._uc.hook_add(UC_HOOK_INSN_INVALID, _hook_invalid, user_data=self)
+        self._uc.hook_add(UC_HOOK_INSN, _hook_cpuid, user_data=self, arg1=UC_X86_INS_CPUID)
 
         # map in codecave
         self._uc.mem_map(CAVE_ADDR, CAVE_SIZE)
@@ -810,6 +811,29 @@ def _hook_interrupt(uc: Uc, number, dp: Dumpulator):
     print(f"interrupt {number}, cip = {dp.regs.cip:0x}")
     uc.emu_stop()
 
+def _hook_cpuid(uc: Uc, dp: Dumpulator):
+    leaf = dp.regs.eax
+    print(f"cpuid {leaf:x}, cip = {dp.regs.cip:x}")
+    if leaf == 0x80000002:
+        dp.regs.eax = 0x65746E49
+        dp.regs.ebx = 0x2952286C
+        dp.regs.ecx = 0x726F4320
+        dp.regs.edx = 0x4D542865
+        return True
+    elif leaf == 0x80000003:
+        dp.regs.eax = 0x37692029
+        dp.regs.ebx = 0x3037382D
+        dp.regs.ecx = 0x50432030
+        dp.regs.edx = 0x20402055
+        return True
+    elif leaf == 0x80000004:
+        dp.regs.eax = 0x30322E33
+        dp.regs.ebx = 0x007A4847
+        dp.regs.ecx = 0x00000000
+        dp.regs.edx = 0x00000000
+        return True
+
+    return False
 
 def _hook_syscall(uc: Uc, dp: Dumpulator):
     index = dp.regs.cax & 0xffff
