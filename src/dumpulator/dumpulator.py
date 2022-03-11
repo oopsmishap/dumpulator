@@ -9,6 +9,7 @@ from pefile import *
 import inspect
 from .native import *
 from capstone import *
+from capstone.x86 import *
 from collections import OrderedDict
 
 syscall_functions = {}
@@ -425,6 +426,7 @@ class Dumpulator(Architecture):
         self.syscalls = []
         self._setup_syscalls()
         self.exports = self._setup_exports()
+        self.resume_execution = False
 
     # Source: https://github.com/mandiant/speakeasy/blob/767edd2272510a5badbab89c5f35d43a94041378/speakeasy/windows/winemu.py#L533
     def _setup_gdt(self, teb_addr):
@@ -716,7 +718,14 @@ class Dumpulator(Architecture):
 
     def start(self, begin, end=0xffffffffffffffff, count=0):
         try:
-            self._uc.emu_start(begin, until=end, count=count)
+            while True:
+                self.resume_execution = False
+                self._uc.emu_start(begin, until=end, count=count)
+                if not self.resume_execution:
+                    break
+                # TODO: handle count
+                begin = self.regs.cip
+                print(f"resuming execution, cip = {begin:0x}")
             print(f'emulation finished, cip = {self.regs.cip:0x}')
             if self.exit_code is not None:
                 print(f"exit code: {self.exit_code}")
@@ -887,6 +896,20 @@ def _hook_syscall(uc: Uc, dp: Dumpulator):
         print(f"syscall index {index:0x} out of range")
         uc.emu_stop()
 
-def _hook_invalid(uc: Uc, address, dp: Dumpulator):
-    print(f"invalid instruction at {address:0x}")
-    return False
+def _hook_invalid(uc: Uc, dp: Dumpulator):
+    cip = dp.regs.cip
+    code = dp.read(cip, 15)
+    instr: CsInsn = next(dp.cs.disasm(code, cip, 1))
+    if instr.id == X86_INS_RDRAND:
+        op: X86Op = instr.operands[0]
+        regname = instr.reg_name(op.reg)
+        if dp._x64 and op.size == 4:
+            regname = "r" + regname[1:]
+        print(f"emulated rdrand {regname}:{op.size}, cip = {cip:0x}+{instr.size:x}")
+        dp.regs.__setattr__(regname, 42)  # TODO: PRNG based on dmp hash
+        dp.regs.cip += instr.size
+        dp.resume_execution = True
+        return True
+    else:
+        print(f"invalid instruction at {cip:0x}: {instr.mnemonic} {instr.op_str}")
+        return False
