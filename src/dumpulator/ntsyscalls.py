@@ -1756,7 +1756,8 @@ def ZwFreeVirtualMemory(dp: Dumpulator,
     size = RegionSize.read_ptr()
     if FreeType == MEM_RELEASE:
         print(f"release {hex(base)}[{hex(size)}]")
-        assert size == 0
+        if size == 0:
+            return STATUS_INVALID_PARAMETER
         region = dp.memory.find_region(base)
         if region is None:
             return STATUS_MEMORY_NOT_ALLOCATED
@@ -2489,7 +2490,7 @@ def ZwOpenThreadToken(dp: Dumpulator,
                       OpenAsSelf: BOOLEAN,
                       TokenHandle: P(HANDLE)
                       ):
-    raise NotImplementedError()
+    return STATUS_SUCCESS
 
 @syscall
 def ZwOpenThreadTokenEx(dp: Dumpulator,

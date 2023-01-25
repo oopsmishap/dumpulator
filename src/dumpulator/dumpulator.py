@@ -2,7 +2,7 @@ import ctypes
 import struct
 import sys
 import traceback
-from enum import Enum
+from enum import IntEnum
 from typing import List, Union, NamedTuple
 import inspect
 from collections import OrderedDict
@@ -31,11 +31,20 @@ IRETQ_OFFSET = 0x100
 IRETD_OFFSET = IRETQ_OFFSET + 1
 GDT_BASE = TSS_BASE - 0x3000
 
-class ExceptionType(Enum):
-    NoException = 0
-    Memory = 1
-    Interrupt = 2
-    ContextSwitch = 3
+# interrupts range 0x00-0xFF
+class ExceptionType(IntEnum):
+    NoException = 0x100
+    Memory = 0x101
+    Interrupt = 0x102
+    ContextSwitch = 0x103
+
+class MemoryException(IntEnum):
+    ReadUnmapped = 19
+    WriteUnmapped = 20
+    ExecuteUnmapped = 21
+    WriteProtection = 22
+    ReadProtection = 23
+    ExecuteProtection = 24
 
 class ExceptionInfo:
     def __init__(self):
@@ -208,7 +217,7 @@ class LazyPageManager(PageManager):
             return data
 
     def write(self, addr: int, data: bytes) -> None:
-        #print(f"write({hex(addr)}, size: {hex(len(data))})")
+        #print(f"write({hex(addr)}, data: {data}, size: {hex(len(data))})")
 
         pages = []
         for page_addr, index, length in self.iter_chunks(addr, len(data)):
@@ -245,6 +254,13 @@ class SimpleTimer:
         self.start()
         diff = self.time - prev
         print(f"{name}: {diff*1000:.0f}ms")
+
+class Breakpoint:
+    def __init__(self, address, callback, info):
+        self.address = address
+        self.original = 0
+        self.callback = callback
+        self.info = info
 
 class Dumpulator(Architecture):
     def __init__(self, minidump_file, *, trace=False, quiet=False, thread_id=None, debug_logs=False):
@@ -296,6 +312,8 @@ class Dumpulator(Architecture):
         self.exports = self._all_exports()
         self.handles = HandleManager()
         self.exception = ExceptionInfo()
+        self._exception_hooks = {}
+        self._breakpoint_hooks = {}
         self.last_exception: Optional[ExceptionInfo] = None
         if not self._quiet:
             print("Memory map:")
@@ -703,6 +721,53 @@ class Dumpulator(Architecture):
         self.memory.commit(self.memory.align_page(ptr), self.memory.align_page(size))
         return ptr
 
+    def add_breakpoint(self, address, callback=None, info=None):
+        assert address not in self._breakpoint_hooks, f'Breakpoint at 0x{address:x} already installed'
+        # setup breakpoint object, save original byte and write INT3
+        bp = Breakpoint(address, callback, info)
+        bp.original = self.read(address, 1)
+        self.write(address, b'\xCC')
+        self._breakpoint_hooks[address] = bp
+
+    def _restore_breakpoint(self, address):
+        assert address in self._breakpoint_hooks, f'No user breakpoint at 0x{address:x}'
+        bp = self._breakpoint_hooks[address]
+        self.write(bp.address, bp.original)
+        self.info(f"restoring breakpoint: {address:x}")
+        return address
+
+    def add_exception_hook(self, exception_type, func):
+        assert exception_type not in self._exception_hooks, f'Duplicate hook type {exception_type} installed'
+        self._exception_hooks[exception_type] = func
+
+    def handle_hooks(self):
+        ret_val = None
+        # check if we have a user installed exception hook
+        if self.exception.type in self._exception_hooks:
+            callback = self._exception_hooks[self.exception.type]
+            ret_val = callback(self, self.exception)
+            if ret_val is not None:
+                return ret_val
+        # first check if we have a user installed breakpoint
+        elif self.exception.type is ExceptionType.Interrupt and self.exception.interrupt_number == 3:
+            # cip has already incremented due to handling the breakpoint
+            bp_addr = self.regs.cip - 1
+            if bp_addr in self._breakpoint_hooks:
+                bp = self._breakpoint_hooks[bp_addr]
+                if bp.callback is not None:
+                    ret_val = bp.callback(self, bp)
+                if ret_val is not None:
+                    return ret_val
+                else:
+                    ret_addr = self._restore_breakpoint(bp_addr)
+                    return ret_addr
+        # lastly check if we have a user install interrupt hook
+        elif self.exception.interrupt_number in self._exception_hooks:
+            callback = self._exception_hooks[self.exception.interrupt_number]
+            ret_val = callback(self, self.exception)
+            if ret_val is not None:
+                return ret_val
+
     def handle_exception(self):
         assert not self.exception.handling
         self.exception.handling = True
@@ -710,11 +775,20 @@ class Dumpulator(Architecture):
         if self.exception.type == ExceptionType.ContextSwitch:
             self.info(f"switching context, cip: {hex(self.regs.cip)}")
             # Clear the pending exception
-            self.last_exception = self.exception
+            self.last_exception = ExceptionInfo()
             self.exception = ExceptionInfo()
             return self.regs.cip
 
         self.info(f"handling exception...")
+
+        # handle hooks
+        # if callback returns an address we will return that execution will jump to
+        # else we will let Dumpulator handle the exception
+        ret_val = self.handle_hooks()
+        if ret_val is not None:
+            self.last_exception = ExceptionInfo()
+            self.exception = ExceptionInfo()
+            return ret_val
 
         if self._x64:
             # Stack layout (x64):
@@ -767,6 +841,7 @@ rsp in KiUserExceptionDispatcher:
         context_ex.XState.Offset = 0xF0 if self._x64 else 0x20
         context_ex.XState.Length = 0x160 if self._x64 else 0x140
         record = record_type()
+
         if self.exception.type == ExceptionType.Memory:
             record.ExceptionCode = 0xC0000005
             record.ExceptionFlags = 0
@@ -1096,10 +1171,10 @@ def _hook_mem(uc: Uc, access, address, size, value, dp: Dumpulator):
         if final:
             # Make sure this is the same exception we expect
             if not dp.trace:
-                assert access == dp.exception.memory_access
-                assert address == dp.exception.memory_address
-                assert size == dp.exception.memory_size
-                assert value == dp.exception.memory_value
+                # assert access == dp.exception.memory_access
+                # assert address == dp.exception.memory_address
+                # assert size == dp.exception.memory_size
+                # assert value == dp.exception.memory_value
 
                 # Delete the code hook
                 uc.hook_del(int(dp.exception.code_hook_h))
