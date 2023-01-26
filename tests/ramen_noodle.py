@@ -72,7 +72,7 @@ def exception_hook(dp: Dumpulator, exception: ExceptionInfo):
             print(f'potential stage3 buffer {mem_region}')
             data = dp.memory.read(mem_region.start, mem_region.size)
 
-            print(f'first bytes of region: {data[:0x20]}')
+            print(f'first bytes of region: {data[:0x10]}')
             mem_region.protect = MemoryProtect.PAGE_EXECUTE_READWRITE
 
             save_file = rf'E:/tmp/ramen_{mem_region.start:x}.bin'
@@ -85,9 +85,9 @@ def exception_hook(dp: Dumpulator, exception: ExceptionInfo):
 def test_bp(dp: Dumpulator, data: Breakpoint):
     print(f'we hit a bp! info: {data.info} address: {data.address:x} original: {data.original}')
 
-dp = Dumpulator("E:/tmp/stage2.dmp", quiet=True)
+dp = Dumpulator("E:/tmp/stage2.dmp", quiet=False)
 
-dp.add_breakpoint(0x6CE352, test_bp, 'entrypoint bp')
+# dp.add_breakpoint(0x6CE352, test_bp, 'entrypoint bp')
 dp.add_exception_hook(ExceptionType.Memory, exception_hook)
 
 dp.start(dp.regs.eip, end=STOP_CODE)

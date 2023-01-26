@@ -64,7 +64,7 @@ class ExceptionInfo:
         self.handling = False
 
     def __str__(self):
-        return f"{self.type}, ({hex(self.tb_start)}, {hex(self.tb_size)}, {self.tb_icount})"
+        return f"{self.type:x}, ({hex(self.tb_start)}, {hex(self.tb_size)}, {self.tb_icount})"
 
 class UnicornPageManager(PageManager):
     def __init__(self, uc: Uc) -> None:
@@ -721,8 +721,9 @@ class Dumpulator(Architecture):
         self.memory.commit(self.memory.align_page(ptr), self.memory.align_page(size))
         return ptr
 
-    def add_breakpoint(self, address, callback=None, info=None):
+    def add_breakpoint(self, address, callback, info=None):
         assert address not in self._breakpoint_hooks, f'Breakpoint at 0x{address:x} already installed'
+        assert callback is not None, f'No callback supplied to breakpoint 0x{address:x}'
         # setup breakpoint object, save original byte and write INT3
         bp = Breakpoint(address, callback, info)
         bp.original = self.read(address, 1)
@@ -746,27 +747,24 @@ class Dumpulator(Architecture):
         if self.exception.type in self._exception_hooks:
             callback = self._exception_hooks[self.exception.type]
             ret_val = callback(self, self.exception)
-            if ret_val is not None:
-                return ret_val
+
         # first check if we have a user installed breakpoint
         elif self.exception.type is ExceptionType.Interrupt and self.exception.interrupt_number == 3:
             # cip has already incremented due to handling the breakpoint
             bp_addr = self.regs.cip - 1
             if bp_addr in self._breakpoint_hooks:
                 bp = self._breakpoint_hooks[bp_addr]
-                if bp.callback is not None:
-                    ret_val = bp.callback(self, bp)
-                if ret_val is not None:
-                    return ret_val
-                else:
-                    ret_addr = self._restore_breakpoint(bp_addr)
-                    return ret_addr
+                ret_val = bp.callback(self, bp)
+                if ret_val is None:
+                    ret_val = self._restore_breakpoint(bp_addr)
+
         # lastly check if we have a user install interrupt hook
         elif self.exception.interrupt_number in self._exception_hooks:
             callback = self._exception_hooks[self.exception.interrupt_number]
             ret_val = callback(self, self.exception)
-            if ret_val is not None:
-                return ret_val
+
+        if ret_val is not None:
+            return ret_val
 
     def handle_exception(self):
         assert not self.exception.handling
@@ -1126,7 +1124,7 @@ def _hook_mem(uc: Uc, access, address, size, value, dp: Dumpulator):
         dp.error(f"forced exit memory operation {access} of {address:x}[{size:x}] = {value:X}")
         return False
     if dp.exception.final and access in fetch_accesses:
-        dp.info(f"fetch from {hex(address)}[{size}] already reported")
+        dp.debug(f"fetch from {hex(address)}[{size}] already reported")
         return False
     # TODO: figure out why when you start executing at 0 this callback is triggered more than once
     try:
@@ -1171,10 +1169,14 @@ def _hook_mem(uc: Uc, access, address, size, value, dp: Dumpulator):
         if final:
             # Make sure this is the same exception we expect
             if not dp.trace:
-                # assert access == dp.exception.memory_access
-                # assert address == dp.exception.memory_address
-                # assert size == dp.exception.memory_size
-                # assert value == dp.exception.memory_value
+                # TODO: Unicorn seems to attempt to execute the entire block before stopping emulation because of
+                #  this it will throw fetch exceptions for each byte until it reaches the end of the block.
+                #  These asserts will end up blowing up Dumpulator into an exception loop.
+                if access not in fetch_accesses:
+                    assert access == dp.exception.memory_access
+                    assert address == dp.exception.memory_address
+                    assert size == dp.exception.memory_size
+                    assert value == dp.exception.memory_value
 
                 # Delete the code hook
                 uc.hook_del(int(dp.exception.code_hook_h))
