@@ -1,7 +1,8 @@
 from dumpulator import *
-from dumpulator.dumpulator import *
+from dumpulator.exceptions import *
 from dumpulator.handles import *
 from dumpulator.memory import *
+
 
 @syscall
 def ZwAllocateVirtualMemory(dp: Dumpulator,
@@ -62,32 +63,34 @@ def ZwAllocateVirtualMemory(dp: Dumpulator,
         assert False
     return STATUS_SUCCESS
 
+
 STOP_CODE = 0xDEADBEEF
 
+
 def exception_hook(dp: Dumpulator, exception: ExceptionInfo):
-    if exception.memory_access == MemoryException.ExecuteProtection:
-        print(f'catching ExecuteProtection 0x{dp.regs.cip:x}')
-        mem_region = dp.memory.find_region(dp.regs.cip)
-        if mem_region.info == 'rwx':
-            print(f'potential stage3 buffer {mem_region}')
-            data = dp.memory.read(mem_region.start, mem_region.size)
+    print(f'catching ExecuteProtection 0x{dp.regs.cip:x}')
+    mem_region = dp.memory.find_region(dp.regs.cip)
+    if mem_region.info == 'rwx':
+        print(f'potential stage3 buffer {mem_region}')
+        data = dp.memory.read(mem_region.start, mem_region.size)
 
-            print(f'first bytes of region: {data[:0x10]}')
-            mem_region.protect = MemoryProtect.PAGE_EXECUTE_READWRITE
+        print(f'first bytes of region: {data[:0x10]}')
+        mem_region.protect = MemoryProtect.PAGE_EXECUTE_READWRITE
 
-            save_file = rf'E:/tmp/ramen_{mem_region.start:x}.bin'
-            with open(save_file, 'wb') as f:
-                f.write(data)
-                print(f'Saved dump to "{save_file}"')
-                return STOP_CODE
+        save_file = rf'E:/tmp/ramen_{mem_region.start:x}.bin'
+        with open(save_file, 'wb') as f:
+            f.write(data)
+            print(f'Saved dump to "{save_file}"')
+            return STOP_CODE
 
 
 def test_bp(dp: Dumpulator, data: Breakpoint):
     print(f'we hit a bp! info: {data.info} address: {data.address:x} original: {data.original}')
 
+
 dp = Dumpulator("E:/tmp/stage2.dmp", quiet=False)
 
-# dp.add_breakpoint(0x6CE352, test_bp, 'entrypoint bp')
-dp.add_exception_hook(ExceptionType.Memory, exception_hook)
+dp.add_breakpoint(0x6CE352, test_bp, 'entrypoint bp')
+dp.add_exception_hook(Exceptions.MemExecuteProt, exception_hook)
 
 dp.start(dp.regs.eip, end=STOP_CODE)
