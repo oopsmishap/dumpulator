@@ -2,8 +2,8 @@ import ctypes
 import struct
 import sys
 import traceback
-from enum import Enum
-from typing import List, Union, NamedTuple
+from enum import IntEnum
+from typing import List, Union, NamedTuple, Callable
 import inspect
 from collections import OrderedDict
 
@@ -17,6 +17,7 @@ from .native import *
 from .details import *
 from .memory import *
 from .modules import *
+from .exceptions import *
 from capstone import *
 from capstone.x86 import *
 
@@ -31,31 +32,6 @@ IRETQ_OFFSET = 0x100
 IRETD_OFFSET = IRETQ_OFFSET + 1
 GDT_BASE = TSS_BASE - 0x3000
 
-class ExceptionType(Enum):
-    NoException = 0
-    Memory = 1
-    Interrupt = 2
-    ContextSwitch = 3
-
-class ExceptionInfo:
-    def __init__(self):
-        self.type = ExceptionType.NoException
-        self.memory_access = 0
-        self.memory_address = 0
-        self.memory_size = 0
-        self.memory_value = 0
-        self.interrupt_number = 0
-        self.code_hook_h: Optional[int] = None  # TODO: should be unicorn.uc_hook_h, but type error
-        self.context: Optional[unicorn.UcContext] = None
-        self.tb_start = 0
-        self.tb_size = 0
-        self.tb_icount = 0
-        self.step_count = 0
-        self.final = False
-        self.handling = False
-
-    def __str__(self):
-        return f"{self.type}, ({hex(self.tb_start)}, {hex(self.tb_size)}, {self.tb_icount})"
 
 class UnicornPageManager(PageManager):
     def __init__(self, uc: Uc) -> None:
@@ -208,7 +184,7 @@ class LazyPageManager(PageManager):
             return data
 
     def write(self, addr: int, data: bytes) -> None:
-        #print(f"write({hex(addr)}, size: {hex(len(data))})")
+        #print(f"write({hex(addr)}, data: {data}, size: {hex(len(data))})")
 
         pages = []
         for page_addr, index, length in self.iter_chunks(addr, len(data)):
@@ -296,6 +272,8 @@ class Dumpulator(Architecture):
         self.exports = self._all_exports()
         self.handles = HandleManager()
         self.exception = ExceptionInfo()
+        self._hooks: Dict[int, Callable] = {}
+        self._breakpoint_hooks: Dict[int, Breakpoint] = {}
         self.last_exception: Optional[ExceptionInfo] = None
         if not self._quiet:
             print("Memory map:")
@@ -703,6 +681,51 @@ class Dumpulator(Architecture):
         self.memory.commit(self.memory.align_page(ptr), self.memory.align_page(size))
         return ptr
 
+    def add_breakpoint(self, address: int, callback: Callable, info: any = None):
+        assert address not in self._breakpoint_hooks, f'Breakpoint at 0x{address:x} already installed'
+        assert callback is not None, f'No callback supplied to breakpoint 0x{address:x}'
+        # setup breakpoint object, save original byte and write INT3
+        bp = Breakpoint(address, callback, info)
+        bp.original = self.read(address, 1)
+        self.write(address, b'\xCC')
+        self._breakpoint_hooks[address] = bp
+
+    def _remove_breakpoint(self, address: int) -> int:
+        assert address in self._breakpoint_hooks, f'No user breakpoint at 0x{address:x}'
+        bp = self._breakpoint_hooks[address]
+        self.write(bp.address, bp.original)
+        self.info(f"restoring breakpoint: {address:x}")
+        return address
+
+    def _restore_breakpoint(self, address: int):
+        # TODO: restore breakpoint after it has been handled to enable us to hit the breakpoint again
+        pass
+
+    def add_exception_hook(self, exception_type: Exceptions, func: Callable):
+        assert exception_type not in self._hooks, f'Duplicate hook type {exception_type} installed'
+        self.info(f'Install hook of type: {exception_type}')
+        self._hooks[exception_type] = func
+
+    def handle_hooks(self) -> Optional[int]:
+        ret_val = None
+
+        # first check if we have a user installed breakpoint
+        if self.exception.code is Exceptions.Interrupt_3:
+            # cip has already incremented due to handling the breakpoint
+            bp_addr = self.regs.cip - 1
+            if bp_addr in self._breakpoint_hooks:
+                bp = self._breakpoint_hooks[bp_addr]
+                ret_val = bp.callback(self, bp)
+                if ret_val is None:
+                    ret_val = self._remove_breakpoint(bp_addr)
+        # then ew check if we have a user installed exception hook
+        elif self.exception.code in self._hooks:
+            callback = self._hooks[self.exception.code]
+            ret_val = callback(self, self.exception)
+
+        if ret_val is not None:
+            return ret_val
+
     def handle_exception(self):
         assert not self.exception.handling
         self.exception.handling = True
@@ -710,11 +733,20 @@ class Dumpulator(Architecture):
         if self.exception.type == ExceptionType.ContextSwitch:
             self.info(f"switching context, cip: {hex(self.regs.cip)}")
             # Clear the pending exception
-            self.last_exception = self.exception
+            self.last_exception = ExceptionInfo()
             self.exception = ExceptionInfo()
             return self.regs.cip
 
         self.info(f"handling exception...")
+
+        # handle hooks
+        # if callback returns an address we will return that execution will jump to
+        # else we will let Dumpulator handle the exception
+        ret_val = self.handle_hooks()
+        if ret_val is not None:
+            self.last_exception = ExceptionInfo()
+            self.exception = ExceptionInfo()
+            return ret_val
 
         if self._x64:
             # Stack layout (x64):
@@ -767,20 +799,13 @@ rsp in KiUserExceptionDispatcher:
         context_ex.XState.Offset = 0xF0 if self._x64 else 0x20
         context_ex.XState.Length = 0x160 if self._x64 else 0x140
         record = record_type()
+
         if self.exception.type == ExceptionType.Memory:
             record.ExceptionCode = 0xC0000005
             record.ExceptionFlags = 0
             record.ExceptionAddress = self.regs.cip
             record.NumberParameters = 2
-            types = {
-                UC_MEM_READ_UNMAPPED: EXCEPTION_READ_FAULT,
-                UC_MEM_WRITE_UNMAPPED: EXCEPTION_WRITE_FAULT,
-                UC_MEM_FETCH_UNMAPPED: EXCEPTION_READ_FAULT,
-                UC_MEM_READ_PROT: EXCEPTION_READ_FAULT,
-                UC_MEM_WRITE_PROT: EXCEPTION_WRITE_FAULT,
-                UC_MEM_FETCH_PROT: EXCEPTION_EXECUTE_FAULT,
-            }
-            record.ExceptionInformation[0] = types[self.exception.memory_access]
+            record.ExceptionInformation[0] = self.exception.code.to_memory_fault()
             record.ExceptionInformation[1] = self.exception.memory_address
         elif self.exception.type == ExceptionType.Interrupt and self.exception.interrupt_number == 3:
             if self._x64:
@@ -836,7 +861,7 @@ rsp in KiUserExceptionDispatcher:
         emu_count = count
         while True:
             try:
-                if self.exception.type != ExceptionType.NoException:
+                if self.exception.type != Exceptions.NoException:
                     if self.exception.final:
                         # Restore the context (unicorn might mess with it before stopping)
                         if self.exception.context is not None:
@@ -1046,24 +1071,24 @@ def _hook_mem(uc: Uc, access, address, size, value, dp: Dumpulator):
         dp.debug(f"committed lazy page {hex(address)}[{hex(size)}]")
         return True
 
-    fetch_accesses = [UC_MEM_FETCH, UC_MEM_FETCH_PROT, UC_MEM_FETCH_UNMAPPED]
-    if access == UC_MEM_FETCH_UNMAPPED and address >= FORCE_KILL_ADDR - 0x10 and address <= FORCE_KILL_ADDR + 0x10 and dp.kill_me is not None:
+    code = translate_exception(access)
+
+    if code == Exceptions.MemExecuteUnmapped and address >= FORCE_KILL_ADDR - 0x10 and address <= FORCE_KILL_ADDR + 0x10 and dp.kill_me is not None:
         dp.error(f"forced exit memory operation {access} of {address:x}[{size:x}] = {value:X}")
         return False
-    if dp.exception.final and access in fetch_accesses:
-        dp.info(f"fetch from {hex(address)}[{size}] already reported")
+    if dp.exception.final and code.memory_access() is MemoryFlags.Execute:
+        dp.debug(f"fetch from {hex(address)}[{size}] already reported")
         return False
     # TODO: figure out why when you start executing at 0 this callback is triggered more than once
     try:
         # Extract exception information
         exception = ExceptionInfo()
-        exception.type = ExceptionType.Memory
-        exception.memory_access = access
+        exception.code = code
         exception.memory_address = address
         exception.memory_size = size
         exception.memory_value = value
         exception.context = uc.context_save()
-        if access not in fetch_accesses:
+        if code.memory_access() is not MemoryFlags.Execute:
             tb = uc.ctl_request_cache(dp.regs.cip)
             exception.tb_start = tb.pc
             exception.tb_size = tb.size
@@ -1072,34 +1097,26 @@ def _hook_mem(uc: Uc, access, address, size, value, dp: Dumpulator):
         # Print exception info
         final = dp.trace or dp.exception.code_hook_h is not None
         info = "final" if final else "initial"
-        if access == UC_MEM_READ_UNMAPPED:
+        if code == Exceptions.MemReadUnmapped:
             dp.error(f"{info} unmapped read from {address:x}[{size:x}], cip = {dp.regs.cip:x}, exception: {exception}")
-        elif access == UC_MEM_WRITE_UNMAPPED:
+        elif code == Exceptions.MemWriteUnmapped:
             dp.error(f"{info} unmapped write to {address:x}[{size:x}] = {value:x}, cip = {dp.regs.cip:x}")
-        elif access == UC_MEM_FETCH_UNMAPPED:
+        elif code == Exceptions.MemExecuteUnmapped:
             dp.error(f"{info} unmapped fetch of {address:x}[{size:x}], cip = {dp.regs.rip:x}, cs = {dp.regs.cs:x}")
         else:
-            names = {
-                UC_MEM_READ: "UC_MEM_READ", # Memory is read from
-                UC_MEM_WRITE: "UC_MEM_WRITE", # Memory is written to
-                UC_MEM_FETCH: "UC_MEM_FETCH", # Memory is fetched
-                UC_MEM_READ_UNMAPPED: "UC_MEM_READ_UNMAPPED", # Unmapped memory is read from
-                UC_MEM_WRITE_UNMAPPED: "UC_MEM_WRITE_UNMAPPED", # Unmapped memory is written to
-                UC_MEM_FETCH_UNMAPPED: "UC_MEM_FETCH_UNMAPPED", # Unmapped memory is fetched
-                UC_MEM_WRITE_PROT: "UC_MEM_WRITE_PROT", # Write to write protected, but mapped, memory
-                UC_MEM_READ_PROT: "UC_MEM_READ_PROT", # Read from read protected, but mapped, memory
-                UC_MEM_FETCH_PROT: "UC_MEM_FETCH_PROT", # Fetch from non-executable, but mapped, memory
-                UC_MEM_READ_AFTER: "UC_MEM_READ_AFTER", # Memory is read from (successful access)
-            }
-            dp.error(f"{info} unsupported access {names.get(access, str(access))} of {address:x}[{size:x}] = {value:X}, cip = {dp.regs.cip:x}")
+            dp.error(f"{info} unsupported access {code} of {address:x}[{size:x}] = {value:X}, cip = {dp.regs.cip:x}")
 
         if final:
             # Make sure this is the same exception we expect
             if not dp.trace:
-                assert access == dp.exception.memory_access
-                assert address == dp.exception.memory_address
-                assert size == dp.exception.memory_size
-                assert value == dp.exception.memory_value
+                # TODO: Unicorn seems to attempt to execute the entire block before stopping emulation because of
+                #  this it will throw fetch exceptions for each byte until it reaches the end of the block.
+                #  These asserts will end up blowing up Dumpulator into an exception loop.
+                if code.memory_access() is not MemoryFlags.Execute:
+                    assert code == dp.exception.code
+                    assert address == dp.exception.memory_address
+                    assert size == dp.exception.memory_size
+                    assert value == dp.exception.memory_value
 
                 # Delete the code hook
                 uc.hook_del(int(dp.exception.code_hook_h))
@@ -1254,6 +1271,7 @@ def _hook_interrupt(uc: Uc, number, dp: Dumpulator):
         # Extract exception information
         exception = ExceptionInfo()
         exception.type = ExceptionType.Interrupt
+        exception.code = Exceptions(Exceptions.Interrupt | number)
         exception.interrupt_number = number
         exception.context = uc.context_save()
         # TODO: this might crash if cip is not valid memory
@@ -1380,6 +1398,7 @@ def _hook_invalid(uc: Uc, dp: Dumpulator):
             assert dp.exception.type == ExceptionType.NoException
             exception = ExceptionInfo()
             exception.type = ExceptionType.ContextSwitch
+            exception.code = Exceptions.ContextSwitch
             exception.final = True
             dp.exception = exception
             return False  # NOTE: returning True would stop emulation
